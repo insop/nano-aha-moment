@@ -15,6 +15,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union
+import difflib
 
 import deepspeed
 import numpy as np
@@ -45,6 +46,11 @@ os.environ["VLLM_USE_V1"] = "0"
 ############################################
 # Prompts and Dataset
 ############################################
+
+THINK_START = "<think>"
+THINK_END = "</think>"
+ANSWER_START = "<answer>"
+ANSWER_END = "</answer>"
 
 SYSTEM_MESSAGE_KERNELBOOK = """
 You are a helpful and experienced Triton kernel developer. You first think about the reasoning process in the mind and then provide the user with the answer.\n
@@ -138,8 +144,7 @@ You are given the following architecture:
 {PROBLEM_INSTRUCTION}
 
 You need to generate the Triton code that is equivalent to the python code.
-Show your work in <think> </think> tags. And return the final Triton code in
-a single codeblock.
+Show your work in <think> </think> tags. And return the final Triton code codeblock in  <answer> </answer> tags, for example <answer> ```python\n ...\n```</answer>.
 """
 
 # Configure logger
@@ -191,6 +196,7 @@ def preprocess_example_kernelbook(
 
 
 
+# TODO (ISS): remove
 # https://github.com/ScalingIntelligence/KernelBench/blob/5cd8a3b6faf61f6315cd45d453474bd5b079a2f9/src/utils.py#L478
 def extract_first_code(output_string: str, code_language_types: list[str]) -> str:
     """
@@ -254,15 +260,17 @@ def format_reward_func(completion: str, EOS_TOKEN: str) -> float:
 
             code = extract_first_code(after_think, ["python"])
 
-            print(f"think_content: {think_content}")
+            # print(f"think_content: {think_content}")
             
             # If we found both think content and something after it, reward is 1.0
             if think_content and code:
-                print(f"matched code: {code}")
+                print(f"think_content:-------\n{think_content}")
+                print(f"matched code:-------\n{code}")
                 return 1.0
             # If we only found think content but nothing after, reward is 0.5
             elif think_content:
-                print(f"no code: {code}")
+                print(f"think_content:-------\n{think_content}")
+                print(f"no code:-------\n{code}")
                 return 0.5
             # If we found nothing, reward is 0.0
             else:
@@ -271,7 +279,203 @@ def format_reward_func(completion: str, EOS_TOKEN: str) -> float:
         # Any error leads to 0 reward
         return 0.0
 
+def extract_thought_solution(output: str) -> tuple[str, str]:
+    """
+    Extract the thought and solution from the output. It is expected to have the following format:
+    <think>
+    ...
+    </think>
+    <answer>
+    ...
+    </answer>
+    """
+    for tag in [THINK_START, THINK_END, ANSWER_START, ANSWER_END]:
+        if output.count(tag) != 1:
+            # print(f"count of {tag} is not 1")
+            raise FormatError(f"count of {tag} is not 1")
 
+    thought = output.split(THINK_START)[1].split(THINK_END)[0].strip()
+    answer = output.split(ANSWER_START)[1].split(ANSWER_END)[0].strip()
+    if len(thought) == 0:
+        raise FormatError("Thought is empty")
+    return thought, answer
+
+# TODO (ISS): fix
+def compute_change_similarities(
+    prediction: str,
+    oracle: str
+) -> float:
+    # # all_file_paths = set(oracle_patch.keys()).union(set(pred_patch.keys()))
+    # # similarities = list[ChangeSimilarity]()
+    # for path in all_file_paths:
+    # pred_change = pred_patch.get(path, "")
+    # oracle_change = oracle_patch.get(path, "")
+    if oracle == "" or prediction == "":
+        # Both are empty changes, meaning search = replace. We should penalize this to avoid
+        # the model predicting empty changes to hack the reward.
+        # NOTE: this should not happen due to (1) the search == replace check in `apply_code_change`
+        # and (2) the `if patch` check in `get_normalized_patch`.
+        change_similarity = 0.0
+    else:
+        change_similarity = difflib.SequenceMatcher(
+            None,
+            prediction,
+            oracle,
+            autojunk=False,
+        ).ratio()
+    # similarities.append(
+    #     ChangeSimilarity(
+    #         path=path,
+    #         pred_change=pred_change,
+    #         oracle_change=oracle_change,
+    #         similarity=change_similarity,
+    #     )
+    # )
+    return change_similarity
+
+# def format_reward_func_new(completion: str, EOS_TOKEN: str) -> float:
+#     """
+#     It expects the completion to contain
+#     the thought and solution in the following format:
+#     <think>
+#     ...
+#     </think>
+#     <answer>
+#     ...
+#     </answer>
+
+#     Args:
+#         completion (str): Generated output
+#         EOS_TOKEN (str): End of sequence token
+
+#     Returns:
+#         float: Reward score
+#     """
+#     try:
+#         # Extract the thought and solution from the output
+#         thought, answer = extract_thought_solution(completion)
+#         if thought is None or answer is None:
+#             return 0.0
+#         # similarities = compute_change_similarities(pred_patch, oracle_patch)
+#         return 1.0
+#     except Exception:
+#         return 0.0
+
+# def calculate_reward(
+#     prediction: str,
+#     oracle: str,
+#     # code_context: dict[str, str],
+#     # oracle_new_content: dict[str, str],
+#     # pred_new_content: dict[str, str],
+# ) -> float:
+#     """
+#     Compute the SWE-RL reward given the code context, oracle patch, and the model output.
+#     Note that this function is a general version of the reward calculation, which can be used
+#     for code changes in any form, not just search/replace edits. For search/replace edits, use
+#     `calculate_search_replace_reward`.
+
+#     The return value is always within the range of [0, 1].
+
+#     Args:
+#         code_context: path -> original content of the file. It doesn't need to
+#             contain the entire codebase, only the files that are affected by the oracle patch.
+#         oracle_new_content: path -> oracle new content of the file after change.
+#         pred_new_content: path -> predicted new content of the file after change.
+
+#     Returns:
+#         A float value representing the reward, and a dictionary containing some metadata.
+#     """
+#     # Obtain a unified diff for each file, for both the predicted and the oracle patch
+#     # oracle_patch = get_normalized_patch(code_context, oracle_new_content)
+#     # pred_patch = get_normalized_patch(code_context, pred_new_content)
+#     # Calculate the reward based on the similarity between the predicted and the oracle patch
+#     similarities = compute_change_similarities(prediction, oracle)
+#     # assert len(similarities) > 0
+#     # This means oracle_patch and pred_patch are both empty, then they are identical and we reward 1.0
+#     # if len(similarities) == 0:
+#     #     assert len(oracle_patch) == 0 and len(pred_patch) == 0
+#     #     return 1.0, dict(similarities=[])
+#     # reward = sum(map(lambda x: x["similarity"], similarities)) / len(similarities)
+#     # return reward, dict(similarities=similarities)
+#     return similarities
+
+class FormatError(Exception):
+    pass
+
+
+# TODO (ISS): fix
+def compute_reward_kernelbook(
+    completion: str,
+    sample: Dict[str, Any], EOS_TOKEN: str) -> Tuple[float, Dict[str, float]]:
+#     oracle_new_content: dict[str, str],
+#     output: str,
+# ) -> tuple[float, dict]:
+    """
+    The search/replace version of the reward calculation. It expects the output to contain
+    the thought and solution in the following format:
+    <think>
+    ...
+    </think>
+    <solution>
+    ...
+    </solution>
+
+    Args:
+        code_context: path -> original content of the file.
+        oracle_new_content: path -> oracle new content of the file after change.
+        output: The output from the model containing the thought and solution.
+
+    Returns:
+        A float value representing the reward, and a dictionary containing some metadata.
+    """
+    python_code = sample["python_code"]
+    triton_code = sample["triton_code"]
+    try:
+        # Extract the thought and solution from the output
+        thought, answer = extract_thought_solution(completion)
+        print(f"thought: {thought}")
+        print(f"answer: {answer}")
+
+        if thought and answer:
+            format_reward = 1.0
+        elif thought or answer:
+            format_reward = 0.5
+        else:
+            format_reward = 0.0
+
+        # Parse the search/replace edits from the solution
+        # pred_search_replaces = parse_search_replace(answer)
+        # if len(pred_search_replaces) == 0:
+        #     raise FormatError("No valid search blocks found")
+        # # Get the new content of each file after applying the search/replace edits
+        # pred_new_content = apply_code_change(code_context, pred_search_replaces)
+        similarity_reward = compute_change_similarities(
+            prediction=answer,
+            oracle=triton_code,
+            # code_context, oracle_new_content, pred_new_content
+        )
+        # metadata["thought"] = thought
+        # metadata["answer"] = answer
+        # return reward, metadata
+        # return 1.0, {}
+
+        metrics = {
+            "format_reward": 1.0,
+            "similarity_reward": similarity_reward,
+            # "equation_reward": 1.0,
+        }
+
+        reward = format_reward + similarity_reward
+        return reward, metrics
+    except Exception as e:
+        metrics = {
+            "format_reward": 0.0,
+            "similarity_reward": 0.0,
+            # "equation_reward": 0.0,
+        }
+        return 0.0, metrics
+
+# TODO (ISS): fix
 def format_reward_func_old(completion: str, EOS_TOKEN: str) -> float:
     """
     Format: <think>...</think>\n```...```\n
@@ -324,84 +528,6 @@ def format_reward_func_old(completion: str, EOS_TOKEN: str) -> float:
         # Any error leads to 0 reward
         return 0.0
 
-
-def equation_reward_func(completion: str, nums: List[int], target: int) -> float:
-    """
-    Evaluates completion based on mathematical correctness of the answer
-
-    Args:
-        completion (str): Generated output
-        target (str): Expected answer
-        nums (list): Available numbers to use in the equation
-
-    Returns:
-        float: Reward score
-    """
-    try:
-        # add synthetic <think> as its already part of the prompt and prefilled for the assistant to more easily match the regex
-        completion = "<think>" + completion
-        # Check if the format is correct
-        match = re.search(r"<answer>(.*?)<\/answer>", completion)
-        if match is None:
-            return 0.0
-        # Extract the "answer" part from the completion
-        equation = match.group(1).strip()
-        # Extract all numbers from the equation
-        used_numbers = [int(n) for n in re.findall(r"\d+", equation)]
-
-        # Check if all numbers are used exactly once
-        if sorted(used_numbers) != sorted(nums):
-            return 0.0
-        # Define a regex pattern that only allows numbers, operators, parentheses, and whitespace
-        allowed_pattern = r"^[\d+\-*/().\s]+$"
-        if not re.match(allowed_pattern, equation):
-            return 0.0
-
-        # Evaluate the equation with restricted globals and locals
-        result = eval(equation, {"__builtins__": None}, {})
-        # Check if the equation is correct and matches the ground truth
-        if abs(float(result) - float(target)) < 1e-5:
-            return 1.0
-        else:
-            return 0.0
-    except Exception:
-        # If evaluation fails, reward is 0
-        return 0.0
-
-
-def compute_reward_countdown(completion: str, sample: Dict[str, Any], EOS_TOKEN: str) -> Tuple[float, Dict[str, float]]:
-    # nums = sample["nums"]
-    # target = sample["target"]
-
-    format_reward = format_reward_func(completion, EOS_TOKEN)
-    # equation_reward = equation_reward_func(completion=completion, nums=nums, target=target)
-    equation_reward = 0.0
-
-    reward = format_reward  + equation_reward
-
-    metrics = {
-        "format_reward": format_reward,
-        "equation_reward": equation_reward,
-    }
-
-    return reward, metrics
-
-def compute_reward_kernelbook(completion: str, sample: Dict[str, Any], EOS_TOKEN: str) -> Tuple[float, Dict[str, float]]:
-    python_code = sample["python_code"]
-    triton_code = sample["triton_code"]
-
-    format_reward = format_reward_func(completion, EOS_TOKEN)
-    # equation_reward = equation_reward_func(completion=completion, nums=nums, target=target)
-    equation_reward = 0.0
-
-    reward = format_reward  + equation_reward
-
-    metrics = {
-        "format_reward": format_reward,
-        "equation_reward": equation_reward,
-    }
-
-    return reward, metrics
 
 def create_training_episodes(
     *,
@@ -1070,7 +1196,7 @@ def main(rank: int):
                     detokenize=False,
                     stop_token_ids=[EOS_TOKEN_ID],
                 ),
-                reward_func=lambda completion, sample: compute_reward(completion, sample, EOS_TOKEN),
+                reward_func=lambda completion, sample: compute_reward_kernelbook(completion, sample, EOS_TOKEN),
             )
             eval_episode_table = dump_episodes(
                 episodes=eval_episodes,
@@ -1260,6 +1386,7 @@ def main(rank: int):
         #########################################################
 
         if dist.get_rank() == 0:
+            # import pdb; pdb.set_trace()
             train_metrics = {k: np.mean(v) for k, v in metrics.items() if None not in v}
             train_metrics["learning_rate"] = policy_model.get_lr()[0]
             logs = {
@@ -1275,11 +1402,13 @@ def main(rank: int):
                 "train/kl_penalty",
                 "train/rewards",
                 "train/reward_metrics/format_reward",
-                "train/reward_metrics/equation_reward",
+                "train/reward_metrics/similarity_reward",
+                # "train/reward_metrics/equation_reward",
                 "train/response_lengths",
                 "eval/rewards",
                 "eval/reward_metrics/format_reward",
-                "eval/reward_metrics/equation_reward",
+                "eval/reward_metrics/similarity_reward",
+                # "eval/reward_metrics/equation_reward",
             ]
             selected_metrics = {k: float(logs[k]) for k in selected_keys if k in logs}
             logger.info(f"KEY METRICS: {selected_metrics}")
