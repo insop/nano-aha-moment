@@ -1,3 +1,12 @@
+import os
+from pathlib import Path
+from pickletools import optimize
+
+SCRATCH = Path.cwd() / ".." / ".." / "nano_r1_scratch"
+# SCRATCH = Path.home() / "nano_r1_scratch"
+
+#os.environ["HF_HOME"] = str(SCRATCH / "hf_home")
+
 import argparse
 import gc
 import logging
@@ -33,6 +42,107 @@ from utils import (
 
 os.environ["VLLM_USE_V1"] = "0"
 
+############################################
+# Prompts and Dataset
+############################################
+
+SYSTEM_MESSAGE_KERNELBOOK = """
+You are a helpful and experienced Triton kernel developer. You first think about the reasoning process in the mind and then provide the user with the answer.\n
+"""
+
+PROBLEM_INSTRUCTION_KERNELBOOK = """
+Optimize the architecture named Model with custom Triton operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code! \n
+"""
+
+PROMPT_TEMPLATE_KERNELBOOK = """
+You write custom Triton kernels to replace the pytorch operators in the given architecture to get speedups.
+You have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom Triton kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.
+Here's an example to show you the syntax of inline embedding custom operators from the Triton DSL in torch: The example given architecture is:
+```
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+class Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+    def forward(self, a, b):
+        return a + b
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.randn(1, 128).cuda()
+    b = torch.randn(1, 128).cuda()
+    return [a, b]
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return []
+```
+The example new arch with custom Triton kernels looks like this:
+```
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+@triton.jit
+def add_kernel(
+    x_ptr,  # Pointer to first input
+    y_ptr,  # Pointer to second input
+    out_ptr,  # Pointer to output
+    n_elements,  # Total number of elements in input/output
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Each program handles a contiguous block of data of size BLOCK_SIZE
+    block_start = tl.program_id(0) * BLOCK_SIZE
+    # Create a range of offsets [0..BLOCK_SIZE-1]
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    # Mask to ensure we don't go out of bounds
+    mask = offsets < n_elements
+    # Load input values
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+    # Perform the elementwise addition
+    out = x + y
+    # Store the result
+    tl.store(out_ptr + offsets, out, mask=mask)
+def triton_add(x: torch.Tensor, y: torch.Tensor):
+    \"\"\"
+    This function wraps the Triton kernel call. It:
+    1. Ensures the inputs are contiguous on GPU.
+    2. Calculates the grid (blocks) needed.
+    3. Launches the Triton kernel.
+    \"\"\"
+    assert x.is_cuda and y.is_cuda, "Tensors must be on CUDA."
+    x = x.contiguous()
+    y = y.contiguous()
+    # Prepare output tensor
+    out = torch.empty_like(x)
+    # Number of elements in the tensor
+    n_elements = x.numel()
+    BLOCK_SIZE = 128  # Tunable parameter for block size
+    # Determine the number of blocks needed
+    grid = lambda meta: ((n_elements + meta["BLOCK_SIZE"] - 1) // meta["BLOCK_SIZE"],)
+    # Launch the Triton kernel
+    add_kernel[grid](x, y, out, n_elements, BLOCK_SIZE=BLOCK_SIZE)
+    return out
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+    def forward(self, a, b):
+        # Instead of "return a + b", call our Triton-based addition
+        return triton_add(a, b)
+```
+You are given the following architecture:
+```
+{python_code}
+```
+{PROBLEM_INSTRUCTION}
+
+You need to generate the Triton code that is equivalent to the python code.
+Show your work in <think> </think> tags. And return the final Triton code in "
+    "<answer> </answer> tags, for example <answer>triton_code</answer>."
+)
+"""
+
 # Configure logger
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -45,9 +155,10 @@ logger.addHandler(ch)
 arg_parser = argparse.ArgumentParser(description="Train R1 model with PPO")
 arg_parser.add_argument("--kl_coeff", type=float, default=0.001, help="KL coefficient for PPO")
 arg_parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for sampling")
-arg_parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-3B", help="Model name/path")
+arg_parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-Coder-3B", help="Model name/path")
+arg_parser.add_argument("--dataset_name", type=str, default="GPUMODE/KernelBook", help="Dataset name/path")
 arg_parser.add_argument("--per_device_batch_size", type=int, default=8, help="Per device batch size")
-arg_parser.add_argument("--max_response_tokens", type=int, default=1024, help="Max response tokens")
+arg_parser.add_argument("--max_response_tokens", type=int, default=16384, help="Max response tokens")
 arg_parser.add_argument("--learning_rate", type=float, default=1e-6, help="Learning rate for training")
 arg_parser.add_argument("--debug", action="store_true", help="Debug mode")
 arg_parser.add_argument("--algorithm", type=str, choices=["grpo", "vineppo"], default="grpo", help="Algorithm to use")
@@ -56,21 +167,43 @@ arg_parser.add_argument("--run_id", type=str, default=None, help="Run ID")
 arg_parser.add_argument("--nproc", type=int, default=1, help="Number of processes (data parallelism) to use")
 
 
-# Load and process dataset
-def preprocess_example(
+# # Load and process dataset
+# def preprocess_example_countdown(
+#     example: Dict[str, Any],
+#     tokenizer: AutoTokenizer,
+#     SYSTEM_MESSAGE: str,
+#     PROMPT_TEMPLATE_COUNT: str,
+# ):
+#     numbers: List[int] = example["nums"]
+#     target: int = example["target"]
+
+#     prefix = [
+#         {"role": "system", "content": SYSTEM_MESSAGE},
+#         {
+#             "role": "user",
+#             "content": PROMPT_TEMPLATE_COUNT.format(numbers=numbers, target=target),
+#         },
+#         {"role": "assistant", "content": "Let me solve this step by step.\n<think>"},
+#     ]
+#     input_ids = tokenizer.apply_chat_template(prefix, tokenize=True, continue_final_message=True)
+#     prompt = tokenizer.decode(input_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+#     return {"prompt": prompt, "input_ids": input_ids}
+
+def preprocess_example_kernelbook(
     example: Dict[str, Any],
     tokenizer: AutoTokenizer,
     SYSTEM_MESSAGE: str,
     PROMPT_TEMPLATE: str,
+    PROBLEM_INSTRUCTION: str,
 ):
-    numbers: List[int] = example["nums"]
-    target: int = example["target"]
+    python_code: str = example["python_code"]
+    triton_code: str = example["triton_code"]
 
     prefix = [
         {"role": "system", "content": SYSTEM_MESSAGE},
         {
             "role": "user",
-            "content": PROMPT_TEMPLATE.format(numbers=numbers, target=target),
+            "content": PROMPT_TEMPLATE.format(python_code=python_code, triton_code=triton_code, PROBLEM_INSTRUCTION=PROBLEM_INSTRUCTION),
         },
         {"role": "assistant", "content": "Let me solve this step by step.\n<think>"},
     ]
@@ -119,6 +252,7 @@ def format_reward_func(completion: str, EOS_TOKEN: str) -> float:
             # Extract the content inside <answer>...</answer>
             answer_content = match.group(2).strip()
 
+            print(f"answer_content: {answer_content}")
             # Check if answer content matches the allowed pattern
             if not re.match(allowed_pattern, answer_content):
                 # If it doesn't match, reward is 0.5
@@ -175,14 +309,15 @@ def equation_reward_func(completion: str, nums: List[int], target: int) -> float
         return 0.0
 
 
-def compute_reward(completion: str, sample: Dict[str, Any], EOS_TOKEN: str) -> Tuple[float, Dict[str, float]]:
-    nums = sample["nums"]
-    target = sample["target"]
+def compute_reward_countdown(completion: str, sample: Dict[str, Any], EOS_TOKEN: str) -> Tuple[float, Dict[str, float]]:
+    # nums = sample["nums"]
+    # target = sample["target"]
 
     format_reward = format_reward_func(completion, EOS_TOKEN)
-    equation_reward = equation_reward_func(completion=completion, nums=nums, target=target)
+    # equation_reward = equation_reward_func(completion=completion, nums=nums, target=target)
+    equation_reward = 0.0
 
-    reward = format_reward + equation_reward
+    reward = format_reward  + equation_reward
 
     metrics = {
         "format_reward": format_reward,
@@ -191,6 +326,22 @@ def compute_reward(completion: str, sample: Dict[str, Any], EOS_TOKEN: str) -> T
 
     return reward, metrics
 
+def compute_reward_kernelbook(completion: str, sample: Dict[str, Any], EOS_TOKEN: str) -> Tuple[float, Dict[str, float]]:
+    python_code = sample["python_code"]
+    triton_code = sample["triton_code"]
+
+    format_reward = format_reward_func(completion, EOS_TOKEN)
+    # equation_reward = equation_reward_func(completion=completion, nums=nums, target=target)
+    equation_reward = 0.0
+
+    reward = format_reward  + equation_reward
+
+    metrics = {
+        "format_reward": format_reward,
+        "equation_reward": equation_reward,
+    }
+
+    return reward, metrics
 
 def create_training_episodes(
     *,
@@ -261,7 +412,7 @@ def create_training_episodes(
         response_token_ids = [all_generations[i] for i in group_indices]
         finish_reasons = [all_finish_reasons[i] for i in group_indices]
         responses = tokenizer.batch_decode(response_token_ids, skip_special_tokens=False)
-        rewards_and_metrics = [compute_reward(resp, sample, EOS_TOKEN) for resp in responses]
+        rewards_and_metrics = [compute_reward_kernelbook(resp, sample, EOS_TOKEN) for resp in responses]
         rewards, reward_metrics = zip(*rewards_and_metrics)
 
         rewards = np.array(rewards)
@@ -612,6 +763,7 @@ def main(rank: int):
         logger.setLevel(logging.ERROR)
 
     if args.debug:
+        assert dist.get_world_size() == 1, "Debug mode only supports single GPU"
         import debugpy
 
         debugpy.listen(5678)
@@ -641,7 +793,7 @@ def main(rank: int):
     # Batch size for each GPU device during training
     PER_DEVICE_BATCH_SIZE = args.per_device_batch_size
     # Learning rate for model updates
-    LEARNING_RATE = 1e-6
+    LEARNING_RATE = args.learning_rate
 
     # Sampling parameters
     # Maximum number of tokens to generate in each response
@@ -665,7 +817,7 @@ def main(rank: int):
         "optimizer": {
             "type": "AdamW",
             "params": {
-                "lr": args.learning_rate,
+                "lr": LEARNING_RATE,
                 "betas": (0.9, 0.999),
                 "eps": 1e-8,
                 "weight_decay": 0.0,
@@ -689,41 +841,29 @@ def main(rank: int):
         RUN_NAME = f"{model_name_short}_temp{TEMPERATURE}_kl{KL_COEFFICIENT}_lr{LEARNING_RATE}_al{args.algorithm}"
     else:
         RUN_NAME = args.run_id
-    EXP_DIR = Path.home() / "scratch" / "nano_aha_moment" / RUN_NAME
+    EXP_DIR = SCRATCH / RUN_NAME
+    # EXP_DIR = Path.home() / "scratch" / "nano_aha_moment" / RUN_NAME
     EXP_DIR.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Logs and Checkpoints will be saved to: {EXP_DIR}")
-
-    ############################################
-    # Prompts and Dataset
-    ############################################
-
-    SYSTEM_MESSAGE = (
-        "You are a helpful assistant. You first think about the reasoning process in the mind "
-        "and then provide the user with the answer."
-    )
-    PROMPT_TEMPLATE = (
-        "Using the numbers {numbers}, create an equation that equals {target}. "
-        "You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. "
-        "Show your work in <think> </think> tags. And return the final equation and answer in "
-        "<answer> </answer> tags, for example <answer>(1 + 2) / (3 * 5)</answer>."
-    )
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     EOS_TOKEN_ID = tokenizer.eos_token_id
     EOS_TOKEN = tokenizer.convert_ids_to_tokens(EOS_TOKEN_ID)
 
-    dataset = load_dataset("Jiayi-Pan/Countdown-Tasks-3to4", split="train")
+    logger.info(f"Loading dataset from {args.dataset_name}")
+    dataset = load_dataset(args.dataset_name, split="train")
     # Rank 0 will preprocess the dataset first
     if dist.get_rank() != 0:
         dist.barrier(device_ids=[torch.cuda.current_device()])
     dataset = dataset.map(
-        preprocess_example,
-        num_proc=6,
+        preprocess_example_kernelbook,
+        num_proc=96,
         fn_kwargs={
             "tokenizer": tokenizer,
-            "SYSTEM_MESSAGE": SYSTEM_MESSAGE,
-            "PROMPT_TEMPLATE": PROMPT_TEMPLATE,
+            "SYSTEM_MESSAGE": SYSTEM_MESSAGE_KERNELBOOK,
+            "PROMPT_TEMPLATE": PROMPT_TEMPLATE_KERNELBOOK,
+            "PROBLEM_INSTRUCTION": PROBLEM_INSTRUCTION_KERNELBOOK,
         },
         desc="Preprocessing dataset",
     )
@@ -844,6 +984,7 @@ def main(rank: int):
         logger.info(f"Skipping {ckpt_iter} rounds of samples")
         for _ in trange(ckpt_iter, disable=dist.get_rank() != 0):
             _ = sampler_rng.choice(len(train_dataset), size=NUM_SAMPLES_PER_ITERATION, replace=False)
+
 
     for iteration in trange(begin_iter, NUM_ITERATIONS):
         logger.info(f"Iteration {iteration}/{NUM_ITERATIONS}")
