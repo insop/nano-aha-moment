@@ -234,6 +234,7 @@ def format_reward_func(completion: str, EOS_TOKEN: str) -> float:
         float: Reward score
     """
 
+    code = None
     try:
         # Synthetically prepend <think> (if your pipeline relies on that to ease matching)
         completion = "<think>" + completion
@@ -251,7 +252,7 @@ def format_reward_func(completion: str, EOS_TOKEN: str) -> float:
 
         if match is None or len(match.groups()) != 2:
             # Format is incorrect
-            return 0.0
+            return 0.0, code
         else:
             # Extract the content inside <think>...</think>
             think_content = match.group(1).strip()
@@ -266,18 +267,18 @@ def format_reward_func(completion: str, EOS_TOKEN: str) -> float:
             if think_content and code:
                 print(f"think_content:-------\n{think_content}")
                 print(f"matched code:-------\n{code}")
-                return 1.0
+                return 1.0, code
             # If we only found think content but nothing after, reward is 0.5
             elif think_content:
                 print(f"think_content:-------\n{think_content}")
                 print(f"no code:-------\n{code}")
-                return 0.5
+                return 0.5, code
             # If we found nothing, reward is 0.0
             else:
-                return 0.0
+                return 0.0, code
     except Exception:
         # Any error leads to 0 reward
-        return 0.0
+        return 0.0, code
 
 def extract_thought_solution(output: str) -> tuple[str, str]:
     """
@@ -289,18 +290,26 @@ def extract_thought_solution(output: str) -> tuple[str, str]:
     ...
     </answer>
     """
-    for tag in [THINK_START, THINK_END, ANSWER_START, ANSWER_END]:
+    for tag in [THINK_START, THINK_END]:
         if output.count(tag) != 1:
             # print(f"count of {tag} is not 1")
             raise FormatError(f"count of {tag} is not 1")
-
     thought = output.split(THINK_START)[1].split(THINK_END)[0].strip()
-    answer = output.split(ANSWER_START)[1].split(ANSWER_END)[0].strip()
     if len(thought) == 0:
         raise FormatError("Thought is empty")
+
+    # if thought is detected,
+    for tag in [ANSWER_START, ANSWER_END]:
+        if output.count(tag) != 1:
+            # print(f"count of {tag} is not 1")
+            # raise FormatError(f"count of {tag} is not 1")
+            return thought, None
+
+    answer = output.split(ANSWER_START)[1].split(ANSWER_END)[0].strip()
+    if len(answer) == 0:
+        return thought, None
     return thought, answer
 
-# TODO (ISS): fix
 def compute_change_similarities(
     prediction: str,
     oracle: str
@@ -310,7 +319,7 @@ def compute_change_similarities(
     # for path in all_file_paths:
     # pred_change = pred_patch.get(path, "")
     # oracle_change = oracle_patch.get(path, "")
-    if oracle == "" or prediction == "":
+    if oracle == "" or prediction == "" or oracle == None or prediction == None:
         # Both are empty changes, meaning search = replace. We should penalize this to avoid
         # the model predicting empty changes to hack the reward.
         # NOTE: this should not happen due to (1) the search == replace check in `apply_code_change`
@@ -323,93 +332,88 @@ def compute_change_similarities(
             oracle,
             autojunk=False,
         ).ratio()
-    # similarities.append(
-    #     ChangeSimilarity(
-    #         path=path,
-    #         pred_change=pred_change,
-    #         oracle_change=oracle_change,
-    #         similarity=change_similarity,
-    #     )
-    # )
     return change_similarity
 
-# def format_reward_func_new(completion: str, EOS_TOKEN: str) -> float:
-#     """
-#     It expects the completion to contain
-#     the thought and solution in the following format:
-#     <think>
-#     ...
-#     </think>
-#     <answer>
-#     ...
-#     </answer>
-
-#     Args:
-#         completion (str): Generated output
-#         EOS_TOKEN (str): End of sequence token
-
-#     Returns:
-#         float: Reward score
-#     """
-#     try:
-#         # Extract the thought and solution from the output
-#         thought, answer = extract_thought_solution(completion)
-#         if thought is None or answer is None:
-#             return 0.0
-#         # similarities = compute_change_similarities(pred_patch, oracle_patch)
-#         return 1.0
-#     except Exception:
-#         return 0.0
-
-# def calculate_reward(
-#     prediction: str,
-#     oracle: str,
-#     # code_context: dict[str, str],
-#     # oracle_new_content: dict[str, str],
-#     # pred_new_content: dict[str, str],
-# ) -> float:
-#     """
-#     Compute the SWE-RL reward given the code context, oracle patch, and the model output.
-#     Note that this function is a general version of the reward calculation, which can be used
-#     for code changes in any form, not just search/replace edits. For search/replace edits, use
-#     `calculate_search_replace_reward`.
-
-#     The return value is always within the range of [0, 1].
-
-#     Args:
-#         code_context: path -> original content of the file. It doesn't need to
-#             contain the entire codebase, only the files that are affected by the oracle patch.
-#         oracle_new_content: path -> oracle new content of the file after change.
-#         pred_new_content: path -> predicted new content of the file after change.
-
-#     Returns:
-#         A float value representing the reward, and a dictionary containing some metadata.
-#     """
-#     # Obtain a unified diff for each file, for both the predicted and the oracle patch
-#     # oracle_patch = get_normalized_patch(code_context, oracle_new_content)
-#     # pred_patch = get_normalized_patch(code_context, pred_new_content)
-#     # Calculate the reward based on the similarity between the predicted and the oracle patch
-#     similarities = compute_change_similarities(prediction, oracle)
-#     # assert len(similarities) > 0
-#     # This means oracle_patch and pred_patch are both empty, then they are identical and we reward 1.0
-#     # if len(similarities) == 0:
-#     #     assert len(oracle_patch) == 0 and len(pred_patch) == 0
-#     #     return 1.0, dict(similarities=[])
-#     # reward = sum(map(lambda x: x["similarity"], similarities)) / len(similarities)
-#     # return reward, dict(similarities=similarities)
-#     return similarities
 
 class FormatError(Exception):
     pass
 
-
-# TODO (ISS): fix
 def compute_reward_kernelbook(
     completion: str,
     sample: Dict[str, Any], EOS_TOKEN: str) -> Tuple[float, Dict[str, float]]:
-#     oracle_new_content: dict[str, str],
-#     output: str,
-# ) -> tuple[float, dict]:
+    """
+    The search/replace version of the reward calculation. It expects the output to contain
+    the thought and solution in the following format:
+    <think>
+    ...
+    </think>
+    <solution>
+    ...
+    </solution>
+
+    Args:
+        code_context: path -> original content of the file.
+        oracle_new_content: path -> oracle new content of the file after change.
+        output: The output from the model containing the thought and solution.
+
+    Returns:
+        A float value representing the reward, and a dictionary containing some metadata.
+    """
+    python_code = sample["python_code"]
+    triton_code = sample["triton_code"]
+
+    format_reward, code = format_reward_func(completion, EOS_TOKEN)
+    similarity_reward = compute_change_similarities(
+        prediction=code,
+        oracle=triton_code,
+    )
+
+    metrics = {
+        "format_reward": format_reward,
+        "similarity_reward": similarity_reward,
+    }
+
+    reward = format_reward + similarity_reward
+    return reward, metrics
+
+    # try:
+    #     # Extract the thought and solution from the output
+    #     thought, answer = extract_thought_solution(completion)
+    #     print(f"thought: {thought}")
+    #     print(f"answer: {answer}")
+
+    #     if thought and answer:
+    #         format_reward = 1.0
+    #     elif thought or answer:
+    #         format_reward = 0.5
+    #     else:
+    #         format_reward = 0.0
+
+    #     similarity_reward = compute_change_similarities(
+    #         prediction=answer,
+    #         oracle=triton_code,
+    #         # code_context, oracle_new_content, pred_new_content
+    #     )
+
+    #     metrics = {
+    #         "format_reward": format_reward,
+    #         "similarity_reward": similarity_reward,
+    #         # "equation_reward": 1.0,
+    #     }
+
+    #     reward = format_reward + similarity_reward
+    #     return reward, metrics
+    # except Exception as e:
+    #     metrics = {
+    #         "format_reward": -1.0,
+    #         "similarity_reward": 0.0,
+    #         # "equation_reward": 0.0,
+    #     }
+    #     return -1.0, metrics
+
+def compute_reward_kernelbook_old(
+    completion: str,
+    sample: Dict[str, Any], EOS_TOKEN: str) -> Tuple[float, Dict[str, float]]:
     """
     The search/replace version of the reward calculation. It expects the output to contain
     the thought and solution in the following format:
@@ -443,24 +447,14 @@ def compute_reward_kernelbook(
         else:
             format_reward = 0.0
 
-        # Parse the search/replace edits from the solution
-        # pred_search_replaces = parse_search_replace(answer)
-        # if len(pred_search_replaces) == 0:
-        #     raise FormatError("No valid search blocks found")
-        # # Get the new content of each file after applying the search/replace edits
-        # pred_new_content = apply_code_change(code_context, pred_search_replaces)
         similarity_reward = compute_change_similarities(
             prediction=answer,
             oracle=triton_code,
             # code_context, oracle_new_content, pred_new_content
         )
-        # metadata["thought"] = thought
-        # metadata["answer"] = answer
-        # return reward, metadata
-        # return 1.0, {}
 
         metrics = {
-            "format_reward": 1.0,
+            "format_reward": format_reward,
             "similarity_reward": similarity_reward,
             # "equation_reward": 1.0,
         }
@@ -469,11 +463,11 @@ def compute_reward_kernelbook(
         return reward, metrics
     except Exception as e:
         metrics = {
-            "format_reward": 0.0,
+            "format_reward": -1.0,
             "similarity_reward": 0.0,
             # "equation_reward": 0.0,
         }
-        return 0.0, metrics
+        return -1.0, metrics
 
 # TODO (ISS): fix
 def format_reward_func_old(completion: str, EOS_TOKEN: str) -> float:
