@@ -51,7 +51,7 @@ You are a helpful and experienced Triton kernel developer. You first think about
 """
 
 PROBLEM_INSTRUCTION_KERNELBOOK = """
-Optimize the architecture named Model with custom Triton operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code! \n
+Optimize the architecture named Model with custom Triton operators! Name your optimized output architecture ModelNew. Output the new code in a codeblock. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new Triton code in a single codeblock, no other text, and NO testing code! \n
 """
 
 PROMPT_TEMPLATE_KERNELBOOK = """
@@ -138,9 +138,8 @@ You are given the following architecture:
 {PROBLEM_INSTRUCTION}
 
 You need to generate the Triton code that is equivalent to the python code.
-Show your work in <think> </think> tags. And return the final Triton code in "
-    "<answer> </answer> tags, for example <answer>triton_code</answer>."
-)
+Show your work in <think> </think> tags. And return the final Triton code in
+a single codeblock.
 """
 
 # Configure logger
@@ -167,28 +166,7 @@ arg_parser.add_argument("--run_id", type=str, default=None, help="Run ID")
 arg_parser.add_argument("--nproc", type=int, default=1, help="Number of processes (data parallelism) to use")
 
 
-# # Load and process dataset
-# def preprocess_example_countdown(
-#     example: Dict[str, Any],
-#     tokenizer: AutoTokenizer,
-#     SYSTEM_MESSAGE: str,
-#     PROMPT_TEMPLATE_COUNT: str,
-# ):
-#     numbers: List[int] = example["nums"]
-#     target: int = example["target"]
-
-#     prefix = [
-#         {"role": "system", "content": SYSTEM_MESSAGE},
-#         {
-#             "role": "user",
-#             "content": PROMPT_TEMPLATE_COUNT.format(numbers=numbers, target=target),
-#         },
-#         {"role": "assistant", "content": "Let me solve this step by step.\n<think>"},
-#     ]
-#     input_ids = tokenizer.apply_chat_template(prefix, tokenize=True, continue_final_message=True)
-#     prompt = tokenizer.decode(input_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
-#     return {"prompt": prompt, "input_ids": input_ids}
-
+# Load and process dataset
 def preprocess_example_kernelbook(
     example: Dict[str, Any],
     tokenizer: AutoTokenizer,
@@ -212,9 +190,91 @@ def preprocess_example_kernelbook(
     return {"prompt": prompt, "input_ids": input_ids}
 
 
+
+# https://github.com/ScalingIntelligence/KernelBench/blob/5cd8a3b6faf61f6315cd45d453474bd5b079a2f9/src/utils.py#L478
+def extract_first_code(output_string: str, code_language_types: list[str]) -> str:
+    """
+    Extract first code block from model output, specified by code_language_type
+    """
+    trimmed = output_string.strip()
+
+    # Extracting the first occurrence of content between backticks
+    code_match = re.search(r"```(.*?)```", trimmed, re.DOTALL)
+
+    if code_match:
+        # Strip leading and trailing whitespace from the extracted code
+        code = code_match.group(1).strip()
+
+        # depends on code_language_type: cpp, python, etc.
+        # sometimes the block of code is ```cpp ... ``` instead of ``` ... ```
+        # in this case strip the cpp out
+        for code_type in code_language_types:
+            if code.startswith(code_type):
+                code = code[len(code_type) :].strip()
+
+        return code
+
+    return None
+
 def format_reward_func(completion: str, EOS_TOKEN: str) -> float:
     """
-    Format: <think>...</think><answer>...</answer>
+    Format: <think>...</think>anything
+
+    Args:
+        completion (str): Generated output
+        EOS_TOKEN (str): End of sequence token
+
+    Returns:
+        float: Reward score
+    """
+
+    try:
+        # Synthetically prepend <think> (if your pipeline relies on that to ease matching)
+        completion = "<think>" + completion
+
+        # Strip EOS token if present
+        if completion.endswith(EOS_TOKEN):
+            completion = completion[: -len(EOS_TOKEN)]
+        
+        # Check if the format is correct
+        # Pattern means:
+        # 1) <think>...contents not including other <think> tags...</think>
+        # 2) anything after </think>
+        regex = r"^<think>([^<]*(?:<(?!/?think>)[^<]*)*)<\/think>(.*)$"
+        match = re.search(regex, completion, re.DOTALL)
+
+        if match is None or len(match.groups()) != 2:
+            # Format is incorrect
+            return 0.0
+        else:
+            # Extract the content inside <think>...</think>
+            think_content = match.group(1).strip()
+            # Extract anything after </think>
+            after_think = match.group(2).strip()
+
+            code = extract_first_code(after_think, ["python"])
+
+            print(f"think_content: {think_content}")
+            
+            # If we found both think content and something after it, reward is 1.0
+            if think_content and code:
+                print(f"matched code: {code}")
+                return 1.0
+            # If we only found think content but nothing after, reward is 0.5
+            elif think_content:
+                print(f"no code: {code}")
+                return 0.5
+            # If we found nothing, reward is 0.0
+            else:
+                return 0.0
+    except Exception:
+        # Any error leads to 0 reward
+        return 0.0
+
+
+def format_reward_func_old(completion: str, EOS_TOKEN: str) -> float:
+    """
+    Format: <think>...</think>\n```...```\n
 
     Also checks that the content within <answer>...</answer> conforms to a
     specified pattern (only digits, + - * / ( ) . and whitespace).
@@ -240,9 +300,9 @@ def format_reward_func(completion: str, EOS_TOKEN: str) -> float:
         # Check if the format is correct
         # Pattern means:
         # 1) <think>...contents not including other <think> tags...</think>
-        # 2) \n
-        # 3) <answer>...anything...</answer>
-        regex = r"^<think>([^<]*(?:<(?!/?think>)[^<]*)*)<\/think>\n<answer>([\s\S]*?)<\/answer>$"
+        # 2) \n (optional)
+        # 3) ```python...anything...```
+        regex = r"^<think>([^<]*(?:<(?!/?think>)[^<]*)*)<\/think>\n```([\s\S]*?)```$"
         match = re.search(regex, completion, re.DOTALL)
 
         if match is None or len(match.groups()) != 2:
@@ -496,7 +556,7 @@ def create_vineppo_training_episodes(
                 values = []
                 for mc in mcs:
                     full_text = tokenizer.decode(prefix + mc, skip_special_tokens=False)
-                    score, _ = compute_reward(full_text, sample, EOS_TOKEN)
+                    score, _ = compute_reward_kernelbook(full_text, sample, EOS_TOKEN)
                     values.append(score)
                 values_estimates.append(sum(values) / len(values))
             return values_estimates
