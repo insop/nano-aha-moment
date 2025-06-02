@@ -169,7 +169,11 @@ arg_parser.add_argument("--algorithm", type=str, choices=["grpo", "vineppo"], de
 arg_parser.add_argument("--vineppo_k", type=int, default=3, help="Number of MC samples to take for each response")
 arg_parser.add_argument("--run_id", type=str, default=None, help="Run ID")
 arg_parser.add_argument("--nproc", type=int, default=1, help="Number of processes (data parallelism) to use")
-
+arg_parser.add_argument("--episodes_per_iteration", type=int, default=64, help="Number of episodes to collect per iteration for training")
+arg_parser.add_argument("--num_iterations", type=int, default=1000, help="Total number of training iterations")
+arg_parser.add_argument("--seed", type=int, default=42, help="Seed")
+arg_parser.add_argument("--num_proc_dataset", type=int, default=96, help="Number of processes to use for dataset preprocessing")
+arg_parser.add_argument("--generations_per_sample", type=int, default=4, help="Number of responses to generate for each input prompt")
 
 # Load and process dataset
 def preprocess_example_kernelbook(
@@ -960,12 +964,12 @@ def main(rank: int):
 
     # RL parameters
     # Total number of training iterations
-    NUM_ITERATIONS = 1000
+    NUM_ITERATIONS = args.num_iterations
     # Number of episodes to collect per iteration for training
-    EPISODES_PER_ITERATION = 64
+    EPISODES_PER_ITERATION = args.episodes_per_iteration
     EPISODES_PER_ITERATION_PER_RANK = EPISODES_PER_ITERATION // dist.get_world_size()
     # Number of responses to generate for each input prompt
-    GENERATIONS_PER_SAMPLE = 4
+    GENERATIONS_PER_SAMPLE = args.generations_per_sample
     # Controls how much the policy can deviate from the reference model
     KL_COEFFICIENT = args.kl_coeff
 
@@ -988,14 +992,35 @@ def main(rank: int):
     VINEPPO_K = args.vineppo_k
     # DeepSpeed configuration
     deepspeed_config = {
+        # ISS: remove after the debug
+        # "fp16": {
+        #     "enabled": False
+        # },
+        # "bf16": {
+        #     "enabled": False
+        # },
+        # "amp": {
+        #     "enabled": True,
+        #     "opt_level": "O1"
+        # },
         "bf16": {"enabled": True},
-        "zero_optimization": {"stage": 2, "overlap_comm": False},
+        "zero_optimization": {
+            "stage": 2,
+            "overlap_comm": False,
+            # ISS: remove after the debug
+            # "round_robin_gradients": True,
+            # "offload_optimizer": {
+            #     "device": "cpu",
+            #     "pin_memory": True,
+            # },
+        },
         "train_batch_size": EPISODES_PER_ITERATION,
         "train_micro_batch_size_per_gpu": PER_DEVICE_BATCH_SIZE,
         "gradient_accumulation_steps": EPISODES_PER_ITERATION_PER_RANK // PER_DEVICE_BATCH_SIZE,
         "gradient_clipping": 1.0,
         "optimizer": {
             "type": "AdamW",
+            # TODO (ISS): add learning rate scheduler???
             "params": {
                 "lr": LEARNING_RATE,
                 "betas": (0.9, 0.999),
@@ -1038,7 +1063,7 @@ def main(rank: int):
         dist.barrier(device_ids=[torch.cuda.current_device()])
     dataset = dataset.map(
         preprocess_example_kernelbook,
-        num_proc=96,
+        num_proc=args.num_proc_dataset,
         fn_kwargs={
             "tokenizer": tokenizer,
             "SYSTEM_MESSAGE": SYSTEM_MESSAGE_KERNELBOOK,
@@ -1052,7 +1077,7 @@ def main(rank: int):
     dist.barrier(device_ids=[torch.cuda.current_device()])
 
     # Split dataset
-    train_test_split = dataset.train_test_split(test_size=500, seed=42)
+    train_test_split = dataset.train_test_split(test_size=500, seed=args.seed)
     train_dataset = train_test_split["train"]
     orig_train_dataset_size = len(train_dataset)
     test_dataset = train_test_split["test"]
@@ -1112,14 +1137,18 @@ def main(rank: int):
         model=MODEL_NAME,
         skip_tokenizer_init=False,  # so LLM does not complain about the tokens present in the model but not in the tokenizer (see https://github.com/vllm-project/vllm/issues/13175), remove when fixed in vllm or qwen.
         gpu_memory_utilization=0.3,
+        # enable_prefix_caching=False,
         enable_prefix_caching=True,
         swap_space=4,
         scheduling_policy="fcfs",
         dtype=torch.bfloat16,
+        # max_model_len=MAX_RESPONSE_TOKENS + 64,
         max_model_len=MAX_RESPONSE_TOKENS + 1024,
         enable_sleep_mode=True,
+        # device=f"cuda:7",
         device=f"cuda:{torch.cuda.current_device()}",
         tensor_parallel_size=1,
+        # enforce_eager=True
     )
     if args.algorithm == "vineppo":
         logits_processors = [fix_oov_logits_processor(inference_engine)]
@@ -1147,7 +1176,7 @@ def main(rank: int):
             },
         )
 
-    sampler_rng = np.random.default_rng(seed=42)
+    sampler_rng = np.random.default_rng(seed=args.seed)
     NUM_SAMPLES_PER_ITERATION = EPISODES_PER_ITERATION_PER_RANK // GENERATIONS_PER_SAMPLE
 
     # Load checkpoint if it exists
