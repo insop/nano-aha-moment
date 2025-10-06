@@ -620,7 +620,7 @@ def compute_pg_loss(
 
     with torch.no_grad():
         entropy = -logps.sum() / labels_mask.sum()  # scalar
-        zero_advantages = close_to_zero(advantages, labels_mask)  # scalar
+        zero_advantages = close_to_zero(advantages[..., 1:], labels_mask)  # scalar
 
     policy_loss = -logps * advantages[..., 1:]  # [batch_size, seq_len-1]
     policy_loss = policy_loss * labels_mask  # [batch_size, seq_len-1]
