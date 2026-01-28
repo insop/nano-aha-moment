@@ -13,6 +13,7 @@ from datasets import Dataset
 from deepspeed import DeepSpeedEngine
 from transformers import AutoTokenizer, PreTrainedModel
 from vllm import LLM, SamplingParams
+from vllm.inputs import TokensPrompt
 
 DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant. You first think about the reasoning process in the mind and then provide the user with the answer."
 DEFAULT_PROMPT_TEMPLATE = "Using the numbers {numbers}, create an equation that equals {target}. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. Show your work in <think> </think> tags. And return the final equation and answer in <answer> </answer> tags, for example <answer>(1 + 2) / (3 * 5)</answer>."
@@ -251,8 +252,11 @@ def evaluate_on_test_set(
         ... )
         >>> print(f"Average reward: {episodes_stats['rewards']:.3f}")
     """
+    inputs_list = [
+        TokensPrompt(prompt_token_ids=tids) for tids in test_dataset["input_ids"]
+    ]
     generations = inference_engine.generate(
-        prompt_token_ids=test_dataset["input_ids"], sampling_params=eval_sampling_params
+        prompts=inputs_list, sampling_params=eval_sampling_params
     )
 
     metrics = {
@@ -370,7 +374,12 @@ def find_last_checkpoint(exp_dir: Path) -> Tuple[Optional[Path], Optional[int]]:
     return ckpt_path, ckpt_iter
 
 
-def load_model_into_vllm(model: Union[DeepSpeedEngine, PreTrainedModel], llm: LLM) -> None:
+def load_model_into_vllm(
+    model: Union[DeepSpeedEngine, PreTrainedModel],
+    llm: LLM,
+    *,
+    allow_insecure_serialization: bool = False,
+) -> None:
     """
     Load weights from a HuggingFace model (either wrapped in DeepSpeed or not) into a vLLM inference engine.
 
@@ -380,14 +389,81 @@ def load_model_into_vllm(model: Union[DeepSpeedEngine, PreTrainedModel], llm: LL
     Args:
         model (Union[DeepSpeedEngine, PreTrainedModel]): The source model to copy weights from.
             Can be either a DeepSpeed-wrapped model or a regular HuggingFace PreTrainedModel.
-        vllm (LLM): The target vLLM inference engine to load the weights into.
+        llm (LLM): The target vLLM inference engine to load the weights into.
             Must be already initialized and ready to accept new weights.
+        allow_insecure_serialization (bool): Only relevant for vLLM v1 when
+            multiprocessing is enabled (engine core runs in a separate process).
+            If True, enables the vLLM flag `VLLM_ALLOW_INSECURE_SERIALIZATION=1`
+            to allow pickling a Python function for `LLM.apply_model(...)`.
+            Prefer disabling v1 multiprocessing instead (see error message).
 
     Returns:
         None
     """
     state_dict = model.module.state_dict() if isinstance(model, DeepSpeedEngine) else model.state_dict()
-    llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights(state_dict.items())
+
+    # vLLM internals changed substantially between v0 and v1. In v1, offline
+    # inference may run the EngineCore in a separate process, in which case
+    # `llm.llm_engine.model_executor` is not available.
+    #
+    # Prefer an in-process fast-path when available; otherwise fall back to the
+    # supported public-ish `LLM.apply_model(...)` API (note: this may involve
+    # serializing weights across process boundaries).
+    try:
+        engine = getattr(llm, "llm_engine", None)
+        model_executor = getattr(engine, "model_executor", None)
+        driver_worker = getattr(model_executor, "driver_worker", None)
+        if driver_worker is not None and hasattr(driver_worker, "get_model"):
+            vllm_model = driver_worker.get_model()
+            vllm_model.load_weights(state_dict.items())
+            return
+
+        if hasattr(llm, "apply_model"):
+            # vLLM v1 multiprocessing uses msgpack-based serialization by
+            # default and *rejects* shipping Python callables unless
+            # VLLM_ALLOW_INSECURE_SERIALIZATION=1.
+            import os
+
+            try:
+                import vllm.envs as vllm_envs
+            except Exception:  # pragma: no cover
+                vllm_envs = None
+
+            if allow_insecure_serialization:
+                os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+                if vllm_envs is not None:
+                    # Ensure env var reads are not stale.
+                    vllm_envs.disable_envs_cache()
+
+            if vllm_envs is not None and not vllm_envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
+                raise RuntimeError(
+                    "vLLM v1 multiprocessing is enabled, but secure serialization blocks "
+                    "sending Python callables required by `LLM.apply_model(...)`. "
+                    "Recommended: disable v1 multiprocessing by setting the env var "
+                    "`VLLM_ENABLE_V1_MULTIPROCESSING=0` *before* creating the vLLM LLM, "
+                    "then recreate `inference_engine`. "
+                    "Alternative (less safe): call `load_model_into_vllm(..., allow_insecure_serialization=True)` "
+                    "or set `VLLM_ALLOW_INSECURE_SERIALIZATION=1`."
+                )
+
+            cpu_weights = [(k, v.detach().cpu()) for k, v in state_dict.items()]
+
+            def _load_into_worker(vllm_model):
+                vllm_model.load_weights(cpu_weights)
+                return True
+
+            llm.apply_model(_load_into_worker)
+            return
+
+        raise AttributeError(
+            "Unsupported vLLM engine: cannot find a way to access the model "
+            "or apply a function on it (missing `model_executor` and `apply_model`)."
+        )
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to load weights into vLLM. This utility depends on vLLM internals; "
+            "please check your vLLM version and engine configuration."
+        ) from e
 
 
 def initialize_training_process_group(rank: int, world_size: int):

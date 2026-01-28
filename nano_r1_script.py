@@ -17,6 +17,10 @@ from deepspeed.runtime.utils import see_memory_usage
 from tqdm import trange
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 from vllm import LLM, CompletionOutput, RequestOutput, SamplingParams
+from vllm.inputs import TokensPrompt
+# from vllm.engine.arg_utils import EngineArgs
+# from vllm.utils.network_utils import get_open_port
+
 
 import wandb
 from utils import (
@@ -55,6 +59,8 @@ arg_parser.add_argument("--algorithm", type=str, choices=["grpo", "vineppo"], de
 arg_parser.add_argument("--vineppo_k", type=int, default=3, help="Number of MC samples to take for each response")
 arg_parser.add_argument("--run_id", type=str, default=None, help="Run ID")
 arg_parser.add_argument("--nproc", type=int, default=1, help="Number of processes (data parallelism) to use")
+arg_parser.add_argument("--scratch_root", type=str, default="/workspace/scratch", help="Root directory for scratch space")
+
 
 
 # Load and process dataset
@@ -430,10 +436,14 @@ def create_vineppo_training_episodes(
             flatten_mc_queries_max_tokens.extend(eps["mc_queries_max_tokens"])
             queries_count.append(len(eps["mc_queries_token_ids"]))
 
+        flatten_mc_queries_list = [
+            TokensPrompt(prompt_token_ids=tids) for tids in flatten_mc_queries
+        ]
+
         # Auxiliary rollouts to get the value estimates
         logger.info("Monte-Carlo value estimation...")
         mc_outputs: List[RequestOutput] = inference_engine.generate(
-            prompt_token_ids=flatten_mc_queries,
+            prompt_token_ids=flatten_mc_queries_list,
             sampling_params=[
                 SamplingParams(
                     n=VINEPPO_K,
@@ -641,11 +651,21 @@ def main(rank: int):
     # Parse command line arguments
     args = arg_parser.parse_args()
 
+
     # rank = int(os.environ.get("RANK", "0"))
     nproc = int(os.environ.get("WORLD_SIZE", "1"))
     nproc = args.nproc
     initialize_training_process_group(rank, nproc)
     curr_cuda_device = torch.device("cuda")
+
+    if False: # ISS test
+        # https://docs.vllm.ai/en/v0.8.1/getting_started/examples/data_parallel.html
+        dp_master_ip = "127.0.0.1"
+        dp_master_port = get_open_port()
+        os.environ["VLLM_DP_MASTER_IP"] = dp_master_ip
+        os.environ["VLLM_DP_MASTER_PORT"] = str(dp_master_port)
+        os.environ["VLLM_DP_RANK"] = str(rank)
+        os.environ["VLLM_DP_SIZE"] = str(nproc)
 
     # Disable logging for non-main processes to avoid duplicate logs
     if dist.get_rank() != 0:
@@ -694,6 +714,7 @@ def main(rank: int):
     TOP_K = -1  # no top k
     # Number of MC samples to take for each response
     VINEPPO_K = args.vineppo_k
+
     # DeepSpeed configuration
     deepspeed_config = {
         "bf16": {"enabled": True},
@@ -729,7 +750,8 @@ def main(rank: int):
         RUN_NAME = f"{model_name_short}_temp{TEMPERATURE}_kl{KL_COEFFICIENT}_lr{LEARNING_RATE}_al{args.algorithm}"
     else:
         RUN_NAME = args.run_id
-    EXP_DIR = Path.home() / "scratch" / "nano_aha_moment" / RUN_NAME
+    
+    EXP_DIR = Path(args.scratch_root) / "nano_aha_moment" / RUN_NAME
     EXP_DIR.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Logs and Checkpoints will be saved to: {EXP_DIR}")
@@ -830,18 +852,24 @@ def main(rank: int):
         vllm_logger = logging.getLogger("vllm")
         vllm_logger.setLevel(logging.ERROR)
 
+    # engine_args = EngineArgs(
+    #     # model="facebook/opt-125m",
+    #     # device="cuda"  # Options: cuda, cpu, tpu, neuron, openvino, xpu
+    #     device=f"cuda:{torch.cuda.current_device()}",
+    # )
     inference_engine = LLM(
         model=MODEL_NAME,
         skip_tokenizer_init=False,
-        gpu_memory_utilization=0.3,
+        gpu_memory_utilization=0.2,
         enable_prefix_caching=True,
-        swap_space=4,
+        swap_space=1,
         scheduling_policy="fcfs",
         dtype=torch.bfloat16,
         max_model_len=MAX_RESPONSE_TOKENS + 1024,
         enable_sleep_mode=True,
-        device=f"cuda:{torch.cuda.current_device()}",
+        # device=f"cuda:{torch.cuda.current_device()}",
         tensor_parallel_size=1,
+        # engine_args=engine_args,
     )
     if args.algorithm == "vineppo":
         logits_processors = [fix_oov_logits_processor(inference_engine)]
@@ -934,9 +962,14 @@ def main(rank: int):
 
         gen_time = time.time()
 
+        samples_list = [
+            TokensPrompt(prompt_token_ids=tids) for tids in samples["input_ids"] 
+        ]
+
         # Sample responses
         outputs = inference_engine.generate(
-            prompt_token_ids=samples["input_ids"],
+            prompts=samples_list,
+            # prompt_token_ids=samples["input_ids"],
             sampling_params=SamplingParams(
                 n=GENERATIONS_PER_SAMPLE,
                 temperature=TEMPERATURE,

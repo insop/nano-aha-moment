@@ -47,6 +47,11 @@ Inspired by [TinyZero](https://github.com/Jiayi-Pan/TinyZero) and [Mini-R1](http
    pip install -r requirements.txt
    ```
 
+   If `flash-attn` fails to install due to build isolation (e.g. it can't import `torch` during the build), retry with:
+   ```bash
+   pip install -r requirements.txt --no-build-isolation
+   ```
+
    **Alternative Installation with uv (Optional)**  
    ```bash
    uv sync
